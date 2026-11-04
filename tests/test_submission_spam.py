@@ -30,7 +30,7 @@ class SpamLimitStorageTests(unittest.TestCase):
             sub_id, _ = self.db.add(
                 user_id=user, full_name="Sender", username=None,
                 message_id=self.message_id,
-                album_key=f"{album}-{self.message_id // 1000}" if False else album,
+                album_key=album,
                 content_type="text" if album is None else "photo",
                 content_text=part,
                 content_fingerprint=part,
