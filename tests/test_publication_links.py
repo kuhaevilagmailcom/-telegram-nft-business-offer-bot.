@@ -42,6 +42,23 @@ class PostFooterTests(unittest.TestCase):
             self.assertEqual(entity_text(content, entity), label)
             self.assertEqual(entity.url, url)
 
+    def test_chelyabinsk_links_and_announcement_messages(self):
+        self.assertEqual(
+            app.PUBLICATION_LINKS,
+            (
+                ("Узнать кто выложил пост", "https://t.me/m/4tffwhGJZjU8"),
+                ("Предложить пост", "https://t.me/pozorCLBbot"),
+            ),
+        )
+        self.assertEqual(
+            app.CHANNEL_PROMOS["promo_wait"],
+            "жду посты @pozorCLBbot жду посты @pozorCLBbot",
+        )
+        self.assertIn(
+            "https://t.me/pozorCHELABA",
+            app.CHANNEL_PROMOS["promo_subscribe"],
+        )
+
     def test_moderation_keyboards_keep_review_actions_and_announcements(self):
         pending = app.buttons(123)
         processed = app.status_buttons(123, "published")
