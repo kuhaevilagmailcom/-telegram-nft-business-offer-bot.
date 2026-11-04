@@ -1,0 +1,489 @@
+"""SQLite storage for submissions, moderation state, and blocked users."""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+
+class Storage:
+    def __init__(self, db_path: str):
+        Path(db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, timeout=20, isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=20000")
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL,
+                username TEXT,
+                album_key TEXT,
+                status TEXT NOT NULL DEFAULT 'collecting',
+                admin_card_id INTEGER,
+                admin_card_mode TEXT NOT NULL DEFAULT 'content',
+                quote_text TEXT NOT NULL DEFAULT '',
+                keyboard_cleaned INTEGER NOT NULL DEFAULT 0,
+                reviewed_by_id INTEGER,
+                reviewed_by_name TEXT,
+                published_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, album_key)
+            );
+            CREATE TABLE IF NOT EXISTS items (
+                submission_id INTEGER NOT NULL REFERENCES submissions(id),
+                user_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                moderation_message_id INTEGER,
+                content_type TEXT NOT NULL DEFAULT '',
+                content_text TEXT NOT NULL DEFAULT '',
+                entities_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (user_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS items_sub_id_idx ON items(submission_id);
+            CREATE INDEX IF NOT EXISTS submissions_status_idx ON submissions(status);
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id INTEGER PRIMARY KEY,
+                blocked_by INTEGER NOT NULL,
+                blocked_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS bot_users_seen_idx
+                ON bot_users(first_seen_at DESC, user_id DESC);
+        """)
+
+        # Add fields when opening databases made by the earlier direct-publication version.
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(submissions)")}
+        if "admin_card_id" not in columns:
+            self.conn.execute("ALTER TABLE submissions ADD COLUMN admin_card_id INTEGER")
+        if "admin_card_mode" not in columns:
+            self.conn.execute(
+                "ALTER TABLE submissions ADD COLUMN admin_card_mode TEXT NOT NULL DEFAULT 'content'"
+            )
+        if "quote_text" not in columns:
+            self.conn.execute("ALTER TABLE submissions ADD COLUMN quote_text TEXT NOT NULL DEFAULT ''")
+        if "keyboard_cleaned" not in columns:
+            self.conn.execute(
+                "ALTER TABLE submissions ADD COLUMN keyboard_cleaned INTEGER NOT NULL DEFAULT 0"
+            )
+        if "reviewed_by_id" not in columns:
+            self.conn.execute("ALTER TABLE submissions ADD COLUMN reviewed_by_id INTEGER")
+        if "reviewed_by_name" not in columns:
+            self.conn.execute("ALTER TABLE submissions ADD COLUMN reviewed_by_name TEXT")
+        if "published_at" not in columns:
+            self.conn.execute("ALTER TABLE submissions ADD COLUMN published_at TEXT")
+
+        item_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(items)")}
+        if "moderation_message_id" not in item_columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN moderation_message_id INTEGER")
+        if "content_type" not in item_columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN content_type TEXT NOT NULL DEFAULT ''")
+        if "content_text" not in item_columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN content_text TEXT NOT NULL DEFAULT ''")
+        if "entities_json" not in item_columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN entities_json TEXT NOT NULL DEFAULT '[]'")
+
+        # Preserve users already known from submissions and blocks when upgrading an existing database.
+        self.conn.execute("""
+            INSERT OR IGNORE INTO bot_users(
+                user_id, username, full_name, first_seen_at, last_seen_at
+            )
+            SELECT user_id, MAX(username), COALESCE(MAX(full_name), 'Пользователь'),
+                   MIN(created_at), MAX(created_at)
+            FROM submissions
+            GROUP BY user_id
+        """)
+        self.conn.execute("""
+            INSERT OR IGNORE INTO bot_users(user_id, full_name)
+            SELECT user_id, 'Пользователь' FROM blocked_users
+        """)
+
+    def add(
+        self,
+        *,
+        user_id: int,
+        full_name: str,
+        username: str | None,
+        message_id: int,
+        album_key: str | None,
+        quote_text: str = "",
+        content_type: str = "",
+        content_text: str = "",
+        entities_json: str = "[]",
+    ) -> tuple[int, bool]:
+        """Add a message and return (submission id, newly created submission)."""
+        with self.conn:
+            existed = self.conn.execute(
+                "SELECT submission_id FROM items WHERE user_id=? AND message_id=?",
+                (user_id, message_id),
+            ).fetchone()
+            if existed:
+                return int(existed["submission_id"]), False
+
+            if album_key:
+                existing = self.conn.execute(
+                    "SELECT id, status FROM submissions WHERE user_id=? AND album_key=?",
+                    (user_id, album_key),
+                ).fetchone()
+                if existing:
+                    if existing["status"] != "collecting":
+                        raise ValueError("Media group was already submitted")
+                    submission_id, fresh = int(existing["id"]), False
+                else:
+                    cur = self.conn.execute(
+                        "INSERT INTO submissions(user_id,full_name,username,album_key,quote_text) "
+                        "VALUES (?,?,?,?,?)",
+                        (user_id, full_name, username, album_key, quote_text),
+                    )
+                    submission_id, fresh = int(cur.lastrowid), True
+            else:
+                cur = self.conn.execute(
+                    "INSERT INTO submissions(user_id,full_name,username,album_key,quote_text) "
+                    "VALUES (?,?,?,NULL,?)",
+                    (user_id, full_name, username, quote_text),
+                )
+                submission_id, fresh = int(cur.lastrowid), True
+
+            self.conn.execute(
+                "INSERT INTO items("
+                "submission_id,user_id,message_id,content_type,content_text,entities_json"
+                ") VALUES (?,?,?,?,?,?)",
+                (
+                    submission_id,
+                    user_id,
+                    message_id,
+                    content_type,
+                    content_text,
+                    entities_json,
+                ),
+            )
+            if quote_text and quote_text.strip():
+                self.conn.execute(
+                    "UPDATE submissions SET quote_text=? "
+                    "WHERE id=? AND (quote_text='' OR quote_text LIKE '[%')",
+                    (quote_text, submission_id),
+                )
+            return submission_id, fresh
+
+    def get(self, submission_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM submissions WHERE id=?", (submission_id,)
+        ).fetchone()
+
+    def message_ids(self, submission_id: int) -> list[int]:
+        return [
+            int(row["message_id"])
+            for row in self.conn.execute(
+                "SELECT message_id FROM items WHERE submission_id=? ORDER BY message_id ASC",
+                (submission_id,),
+            )
+        ]
+
+    def items_for_submission(self, submission_id: int) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM items WHERE submission_id=? ORDER BY message_id ASC",
+                (submission_id,),
+            )
+        )
+
+    def move(
+        self,
+        submission_id: int,
+        from_status: str,
+        to_status: str,
+        *,
+        reviewed_by_id: int | None = None,
+        reviewed_by_name: str | None = None,
+    ) -> bool:
+        with self.conn:
+            assignments = ["status=?"]
+            params: list[object] = [to_status]
+            if to_status == "published":
+                assignments.append("published_at=datetime('now')")
+            if reviewed_by_id is not None or reviewed_by_name is not None:
+                assignments.extend(["reviewed_by_id=?", "reviewed_by_name=?"])
+                params.extend([reviewed_by_id, reviewed_by_name])
+            params.extend([submission_id, from_status])
+            cur = self.conn.execute(
+                f"UPDATE submissions SET {', '.join(assignments)} WHERE id=? AND status=?",
+                params,
+            )
+            return cur.rowcount == 1
+
+    def set_card_pending(
+        self, submission_id: int, card_id: int, card_mode: str = "content"
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE submissions SET admin_card_id=?, admin_card_mode=?, keyboard_cleaned=0, "
+                "status=CASE WHEN status='notifying' THEN 'pending' ELSE status END "
+                "WHERE id=?",
+                (card_id, card_mode, submission_id),
+            )
+
+    def set_moderation_message_ids(
+        self, submission_id: int, moderation_message_ids: list[int]
+    ) -> None:
+        rows = list(
+            self.conn.execute(
+                "SELECT message_id FROM items WHERE submission_id=? ORDER BY message_id ASC",
+                (submission_id,),
+            )
+        )
+        if len(rows) != len(moderation_message_ids):
+            raise ValueError("Moderation message count does not match submission items")
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE items SET moderation_message_id=? "
+                "WHERE submission_id=? AND message_id=?",
+                [
+                    (moderation_id, submission_id, int(row["message_id"]))
+                    for row, moderation_id in zip(rows, moderation_message_ids)
+                ],
+            )
+
+    def moderation_message_ids(self, submission_id: int) -> list[int]:
+        return [
+            int(row["moderation_message_id"])
+            for row in self.conn.execute(
+                "SELECT moderation_message_id FROM items "
+                "WHERE submission_id=? AND moderation_message_id IS NOT NULL "
+                "ORDER BY message_id ASC",
+                (submission_id,),
+            )
+        ]
+
+    def remember_primary_moderation_message_id(
+        self, submission_id: int, moderation_message_id: int
+    ) -> None:
+        row = self.conn.execute(
+            "SELECT message_id FROM items WHERE submission_id=? ORDER BY message_id ASC LIMIT 1",
+            (submission_id,),
+        ).fetchone()
+        if row:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE items SET moderation_message_id=? "
+                    "WHERE submission_id=? AND message_id=?",
+                    (moderation_message_id, submission_id, int(row["message_id"])),
+                )
+
+    def register_user(
+        self, user_id: int, username: str | None, full_name: str
+    ) -> None:
+        """Remember every person who opens or messages the bot in private."""
+        name = full_name.strip() or "Пользователь"
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO bot_users(user_id, username, full_name, first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, datetime('now'), datetime('now'))
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    full_name=excluded.full_name,
+                    last_seen_at=datetime('now')
+                """,
+                (int(user_id), username, name),
+            )
+
+    def sync_known_users(self) -> None:
+        """Rebuild the recipient registry from every user still present in this database."""
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO bot_users(
+                    user_id, username, full_name, first_seen_at, last_seen_at
+                )
+                SELECT user_id, MAX(username), COALESCE(MAX(full_name), 'Пользователь'),
+                       MIN(created_at), MAX(created_at)
+                FROM submissions
+                GROUP BY user_id
+            """)
+            self.conn.execute("""
+                INSERT OR IGNORE INTO bot_users(user_id, full_name)
+                SELECT user_id, 'Пользователь' FROM items
+                GROUP BY user_id
+            """)
+            self.conn.execute("""
+                INSERT OR IGNORE INTO bot_users(user_id, full_name)
+                SELECT user_id, 'Пользователь' FROM blocked_users
+            """)
+
+    def known_submission_user_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS total FROM submissions"
+        ).fetchone()
+        return int(row["total"] or 0)
+
+    def user_count(self) -> int:
+        self.sync_known_users()
+        row = self.conn.execute("SELECT COUNT(*) AS total FROM bot_users").fetchone()
+        return int(row["total"] or 0)
+
+    def list_users(self, offset: int = 0, limit: int = 10) -> list[sqlite3.Row]:
+        self.sync_known_users()
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 20))
+        return list(
+            self.conn.execute(
+                """
+                SELECT user_id, username, full_name, first_seen_at, last_seen_at
+                FROM bot_users
+                ORDER BY first_seen_at DESC, user_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+        )
+
+    def all_user_ids(self) -> list[int]:
+        self.sync_known_users()
+        return [
+            int(row["user_id"])
+            for row in self.conn.execute("SELECT user_id FROM bot_users ORDER BY user_id")
+        ]
+
+    def published_counts(
+        self,
+        *,
+        today_start: str,
+        week_start: str,
+        month_start: str,
+        now: str,
+    ) -> dict[str, int]:
+        """Count published submissions in local-time windows expressed as UTC strings."""
+        row = self.conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(published_at, created_at) >= ?
+                     AND COALESCE(published_at, created_at) < ? THEN 1 ELSE 0 END), 0) AS today,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(published_at, created_at) >= ?
+                     AND COALESCE(published_at, created_at) < ? THEN 1 ELSE 0 END), 0) AS week,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(published_at, created_at) >= ?
+                     AND COALESCE(published_at, created_at) < ? THEN 1 ELSE 0 END), 0) AS month
+            FROM submissions
+            WHERE status='published'
+            """,
+            (today_start, now, week_start, now, month_start, now),
+        ).fetchone()
+        return {
+            "today": int(row["today"] or 0),
+            "week": int(row["week"] or 0),
+            "month": int(row["month"] or 0),
+        }
+
+    def moderator_top(self, limit: int = 10) -> list[sqlite3.Row]:
+        """Return moderators ranked by the number of completed decisions."""
+        limit = max(1, min(int(limit), 20))
+        return list(
+            self.conn.execute(
+                """
+                SELECT
+                    reviewed_by_id,
+                    MAX(COALESCE(NULLIF(reviewed_by_name, ''), 'Модератор')) AS reviewed_by_name,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status='published' THEN 1 ELSE 0 END) AS accepted,
+                    SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected,
+                    SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) AS blocked
+                FROM submissions
+                WHERE reviewed_by_id IS NOT NULL
+                  AND status IN ('published', 'rejected', 'blocked')
+                GROUP BY reviewed_by_id
+                ORDER BY total DESC, accepted DESC, rejected ASC, reviewed_by_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        )
+
+    def is_blocked(self, user_id: int) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM blocked_users WHERE user_id=?", (user_id,)
+        ).fetchone() is not None
+
+    def block_user(self, user_id: int, blocked_by: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO blocked_users(user_id,blocked_by) VALUES (?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET blocked_by=excluded.blocked_by, "
+                "blocked_at=datetime('now')",
+                (user_id, blocked_by),
+            )
+
+    def unblock_user(self, user_id: int) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM blocked_users WHERE user_id=?", (user_id,)
+            )
+            return cur.rowcount == 1
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def prepare_keyboard_cleanup_version(self, version: str) -> None:
+        """Force one cleanup pass when the keyboard-cleanup logic changes."""
+        current = self.get_setting("keyboard_cleanup_version")
+        if current == version:
+            return
+        with self.conn:
+            self.conn.execute(
+                "UPDATE submissions SET keyboard_cleaned=0 "
+                "WHERE admin_card_id IS NOT NULL AND status != 'pending'"
+            )
+            self.conn.execute(
+                "INSERT INTO settings(key,value) VALUES('keyboard_cleanup_version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (version,),
+            )
+
+    def cards_needing_keyboard_cleanup(self) -> list[sqlite3.Row]:
+        """Return pending cards to refresh and processed cards with keyboards still to clear."""
+        return list(
+            self.conn.execute(
+                "SELECT id, admin_card_id, admin_card_mode, status FROM submissions "
+                "WHERE admin_card_id IS NOT NULL "
+                "AND (status='pending' OR keyboard_cleaned=0) ORDER BY id ASC"
+            )
+        )
+
+    def mark_keyboard_cleaned(self, submission_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE submissions SET keyboard_cleaned=1 WHERE id=?",
+                (submission_id,),
+            )
+
+    def recoverable_ids(self) -> list[int]:
+        return [
+            int(row["id"])
+            for row in self.conn.execute(
+                "SELECT id FROM submissions WHERE status='collecting' ORDER BY id ASC"
+            )
+        ]
+
+    def close(self) -> None:
+        self.conn.close()
