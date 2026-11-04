@@ -64,13 +64,13 @@ PUBLICATION_DISCLAIMER = (
 
 PUBLICATION_LINKS = (
     ("Узнать кто выложил пост", "https://t.me/m/4tffwhGJZjU8"),
-    ("Предложить пост", "https://t.me/PozorMgnBot"),
+    ("Предложить пост", "https://t.me/pozorCLBbot"),
 )
 CHANNEL_PROMOS = {
-    "promo_wait": "жду посты @PozorMgnBot жду посты @PozorMgnBot",
+    "promo_wait": "жду посты @pozorCLBbot жду посты @pozorCLBbot",
     "promo_subscribe": (
-        "ПОДПИШИТЕСЬ НА НАШ ПЕРЕХОДНИК в случае сноса тгк туда опубликуем новую "
-        "https://t.me/perehodnikpozora"
+        "ПОДПИШИТЕСЬ НА НАШ КАНАЛ "
+        "https://t.me/pozorCHELABA"
     ),
 }
 
